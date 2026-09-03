@@ -1,0 +1,28 @@
+[Unit]
+Description=MapLink Server management API and web console
+After=network-online.target frps.service
+Wants=network-online.target frps.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/frp-manager/server.env
+ExecStart=/usr/local/bin/frp-manager
+Restart=on-failure
+RestartSec=3
+User=root
+Group=root
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+ReadWritePaths=/etc/frp-manager /etc/frp /run /var/log
+
+[Install]
+WantedBy=multi-user.target

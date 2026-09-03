@@ -1,0 +1,14 @@
+/bin/
+/dist/
+/web/node_modules/
+/web/.next/
+/web/out/
+/web/.vinext/
+/web/.wrangler/
+*.log
+*.pem
+*.key
+.env
+.env.*
+!.env.example
+/web/.openai/

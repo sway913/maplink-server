@@ -1,0 +1,233 @@
+name: CI and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Full test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Go tests with race detector
+        run: go test -race ./...
+
+      - name: Go vet
+        run: go vet ./...
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Lint web console
+        working-directory: web
+        run: npm run lint
+
+      - name: Test web console
+        working-directory: web
+        run: npm test
+
+      - name: Build static web console
+        working-directory: web
+        run: npm run build:static
+
+      - name: Reject committed credentials and private keys
+        shell: bash
+        run: |
+          set -euo pipefail
+          private_prefix='-----BEGIN '
+          private_suffix='(OPENSSH|RSA|EC|DSA) PRIVATE KEY-----'
+          github_prefix='github''_pat_'
+          gh_prefix='gh''[pousr]_'
+          pattern="${private_prefix}${private_suffix}|${github_prefix}[A-Za-z0-9_]{20,}|${gh_prefix}[A-Za-z0-9]{20,}"
+          if git grep -nE -- "$pattern"; then
+            echo '检测到疑似真实凭据或私钥。' >&2
+            exit 1
+          fi
+
+  cloud-e2e:
+    name: Cloud browser and relay E2E
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Exercise complete remote-control relay protocol
+        run: go test ./internal/manager -run 'TestRemoteRelayAuthenticatesAndMovesFramesAndInputWithoutPersistence' -count=1 -v
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install Chromium E2E runtime
+        working-directory: web
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Build and exercise the real management page
+        working-directory: web
+        run: |
+          npm run build:static
+          npm run test:e2e
+
+  package:
+    name: Package Linux ${{ matrix.arch }}
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, cloud-e2e]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    env:
+      FRP_VERSION: 0.71.0
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Resolve and validate version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {
+            echo "无效版本标签: $GITHUB_REF_NAME" >&2
+            exit 1
+          }
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build MapLink Server
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          CGO_ENABLED=0 GOOS=linux go build -trimpath \
+            -ldflags="-s -w -X github.com/sway913/maplink-server/internal/version.Value=$VERSION" \
+            -o build/frp-manager ./cmd/frp-manager
+          test "$(build/frp-manager version)" = "$VERSION"
+
+      - name: Build web console
+        working-directory: web
+        run: |
+          npm ci
+          npm run build:static
+
+      - name: Download and verify official frps
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}"
+          archive="frp_${FRP_VERSION}_linux_${{ matrix.arch }}.tar.gz"
+          curl --fail --location --retry 3 --output "$archive" "$base/$archive"
+          curl --fail --location --retry 3 --output frp_sha256_checksums.txt "$base/frp_sha256_checksums.txt"
+          grep "  $archive$" frp_sha256_checksums.txt > selected-checksum.txt
+          test -s selected-checksum.txt
+          sha256sum -c selected-checksum.txt
+          tar -xzf "$archive"
+          cp "frp_${FRP_VERSION}_linux_${{ matrix.arch }}/frps" build/frps
+          cp "frp_${FRP_VERSION}_linux_${{ matrix.arch }}/LICENSE" build/frp-LICENSE
+
+      - name: Assemble release archive
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          name="maplink-server-v${VERSION}-linux-${{ matrix.arch }}"
+          stage="dist/$name"
+          mkdir -p "$stage/web" "$stage/third-party"
+          install -m 755 build/frp-manager "$stage/frp-manager"
+          install -m 755 build/frps "$stage/frps"
+          cp -R web/out/. "$stage/web/"
+          cp -R deploy docs scripts README.md SECURITY.md "$stage/"
+          cp build/frp-LICENSE "$stage/third-party/frp-LICENSE"
+          chmod +x "$stage/scripts/"*.sh
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          sha256sum "dist/$name.tar.gz" > "dist/$name-SHA256SUMS.txt"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: maplink-server-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*-SHA256SUMS.txt
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: maplink-server-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify release archives
+        working-directory: dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          for sums in *-SHA256SUMS.txt; do
+            sha256sum -c "$sums"
+          done
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" dist/* \
+            --verify-tag \
+            --title "MapLink Server $TAG" \
+            --notes-file .github/release-notes.md \
+            --generate-notes
