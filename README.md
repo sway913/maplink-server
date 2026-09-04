@@ -116,15 +116,28 @@ npm run build:static
 
 - [部署、证书、备份与升级](docs/deployment.md)
 - [HTTP API 与认证方式](docs/api.md)
+- [AI Native L3 工程闭环](docs/ai-native-l3.md)
+- [AI/Agent 工作规则](AGENTS.md)
+- [贡献与 PR 流程](CONTRIBUTING.md)
 - [安全策略](SECURITY.md)
 
 ## 自动测试与发行
 
-每次 push 和 Pull Request 都会在 GitHub Actions 运行：
+本地统一验证入口：
 
-- `go test -race ./...`
-- `go vet ./...`
-- Web ESLint、单元测试与静态构建
-- 敏感信息扫描
+```bash
+./scripts/verify.sh unit
+./scripts/verify.sh all
+```
 
-推送 `v*` 标签后，Actions 会在全部测试通过后构建 Linux x86-64/ARM64 发行包、生成 SHA-256 校验文件并创建 GitHub Release。
+Windows 使用 `./scripts/verify.ps1 -Suite unit|all`。提交 PR 前必须至少完成本地 Unit Test。
+
+每次 push 和 Pull Request 都会在 GitHub Actions 分层运行：
+
+- Unit tests
+- Integration tests
+- Build and static checks
+- Core E2E（完整远控协议 + Chromium 管理页）
+- AI Native evidence（验收、Plan、验证和 Review 证据）
+
+`main` 只接受 Pull Request，Required Checks 失败时禁止合并。推送 `v*` 标签后，Actions 会在全部检查通过后构建 Linux x86-64/ARM64 发行包、生成 SHA-256 校验文件并创建 GitHub Release。
