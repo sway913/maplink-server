@@ -247,12 +247,11 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Verify release archives
-        working-directory: dist
         shell: bash
         run: |
           set -euo pipefail
-          test "$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)" = 2
-          for sums in *-SHA256SUMS.txt; do sha256sum -c "$sums"; done
+          test "$(find dist -maxdepth 1 -name '*.tar.gz' | wc -l)" = 2
+          for sums in dist/*-SHA256SUMS.txt; do sha256sum -c "$sums"; done
       - name: Publish and verify release
         env:
           GH_TOKEN: ${{ github.token }}
