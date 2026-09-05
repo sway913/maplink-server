@@ -180,10 +180,14 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p build
+          host_arch=$(go env GOHOSTARCH)
+          native_version=$(CGO_ENABLED=0 GOOS=linux GOARCH="$host_arch" go run -trimpath \
+            -ldflags="-s -w -X github.com/sway913/maplink-server/internal/version.Value=$VERSION" \
+            ./cmd/frp-manager version)
+          test "$native_version" = "$VERSION"
           CGO_ENABLED=0 GOOS=linux go build -trimpath \
             -ldflags="-s -w -X github.com/sway913/maplink-server/internal/version.Value=$VERSION" \
             -o build/frp-manager ./cmd/frp-manager
-          test "$(build/frp-manager version)" = "$VERSION"
       - name: Build web console
         working-directory: web
         run: |
@@ -243,12 +247,11 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Verify release archives
-        working-directory: dist
         shell: bash
         run: |
           set -euo pipefail
-          test "$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)" = 2
-          for sums in *-SHA256SUMS.txt; do sha256sum -c "$sums"; done
+          test "$(find dist -maxdepth 1 -name '*.tar.gz' | wc -l)" = 2
+          for sums in dist/*-SHA256SUMS.txt; do sha256sum -c "$sums"; done
       - name: Publish and verify release
         env:
           GH_TOKEN: ${{ github.token }}
