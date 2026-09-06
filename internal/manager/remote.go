@@ -20,6 +20,8 @@ import (
 
 const (
 	remoteHostTTL       = 30 * time.Second
+	remotePendingTTL    = 35 * time.Second
+	remoteControllerTTL = 30 * time.Second
 	remoteSessionTTL    = 90 * time.Second
 	remoteFrameLimit    = 3 << 20
 	remoteJSONLimit     = 128 << 10
@@ -56,6 +58,7 @@ type remoteSession struct {
 	ScreenHeight           int
 	CreatedAt              time.Time
 	UpdatedAt              time.Time
+	ControllerSeenAt       time.Time
 	FrameSequence          uint64
 	Frame                  []byte
 	InputSequence          uint64
@@ -247,7 +250,19 @@ func (h *remoteHub) cleanupLocked(now time.Time) {
 		}
 	}
 	for id, session := range h.sessions {
-		if now.Sub(session.UpdatedAt) > remoteSessionTTL {
+		switch {
+		case session.State == "pending" && now.Sub(session.CreatedAt) > remotePendingTTL:
+			session.State = "failed"
+			session.Error = "对方设备响应超时"
+			session.Frame = nil
+			session.Inputs = nil
+			session.UpdatedAt = now
+		case session.State == "active" && now.Sub(session.ControllerSeenAt) > remoteControllerTTL:
+			session.State = "closed"
+			session.Frame = nil
+			session.Inputs = nil
+			session.UpdatedAt = now
+		case session.State != "pending" && session.State != "active" && now.Sub(session.UpdatedAt) > remoteSessionTTL:
 			delete(h.sessions, id)
 		}
 	}
@@ -404,7 +419,7 @@ func (s *Server) remoteCreateSession(w http.ResponseWriter, r *http.Request) {
 	session := &remoteSession{
 		ID: id, TargetDeviceID: request.TargetDeviceID, ControllerDeviceID: request.ControllerDeviceID,
 		ControllerSSHPublicKey: request.ControllerSSHPublicKey,
-		State:                  "pending", CreatedAt: now, UpdatedAt: now,
+		State:                  "pending", CreatedAt: now, UpdatedAt: now, ControllerSeenAt: now,
 	}
 	s.remote.sessions[id] = session
 	view := viewRemoteSession(session)
@@ -436,6 +451,9 @@ func (s *Server) remoteSessionStatus(w http.ResponseWriter, r *http.Request) {
 	if !authorizeRemoteDevice(w, principal, session.TargetDeviceID, session.ControllerDeviceID) {
 		s.remote.mu.Unlock()
 		return
+	}
+	if principal.Legacy || principal.DeviceID == session.ControllerDeviceID {
+		session.ControllerSeenAt = time.Now()
 	}
 	view := viewRemoteSession(session)
 	s.remote.mu.Unlock()
@@ -557,6 +575,7 @@ func (s *Server) remoteDownloadFrame(w http.ResponseWriter, r *http.Request) {
 	deadline := time.Now().Add(remoteLongPoll)
 	for {
 		s.remote.mu.Lock()
+		s.remote.cleanupLocked(time.Now())
 		session, found := s.withRemoteSession(w, r)
 		if !found {
 			s.remote.mu.Unlock()
@@ -566,6 +585,7 @@ func (s *Server) remoteDownloadFrame(w http.ResponseWriter, r *http.Request) {
 			s.remote.mu.Unlock()
 			return
 		}
+		session.ControllerSeenAt = time.Now()
 		if session.FrameSequence > after && len(session.Frame) > 0 {
 			frame := append([]byte(nil), session.Frame...)
 			sequence, width, height := session.FrameSequence, session.ScreenWidth, session.ScreenHeight
@@ -629,6 +649,7 @@ func (s *Server) remotePostInputs(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.remote.mu.Lock()
+	s.remote.cleanupLocked(time.Now())
 	session, found := s.withRemoteSession(w, r)
 	if !found {
 		s.remote.mu.Unlock()
@@ -643,6 +664,7 @@ func (s *Server) remotePostInputs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errors.New("远程会话未激活"))
 		return
 	}
+	session.ControllerSeenAt = time.Now()
 	for _, event := range request.Events {
 		session.InputSequence++
 		session.Inputs = append(session.Inputs, sequencedRemoteInput{Sequence: session.InputSequence, Event: event})
