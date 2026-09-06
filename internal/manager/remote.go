@@ -69,6 +69,7 @@ type remoteSession struct {
 	ClipboardSequence      uint64
 	ClipboardText          string
 	FrameReady             chan struct{}
+	InputReady             chan struct{}
 	ClipboardReady         chan struct{}
 }
 
@@ -277,6 +278,7 @@ func (h *remoteHub) cleanupLocked(now time.Time) {
 			session.ClipboardText = ""
 			session.UpdatedAt = now
 			notifyRemoteSession(session.FrameReady)
+			notifyRemoteSession(session.InputReady)
 			notifyRemoteSession(session.ClipboardReady)
 		case session.State == "active" && now.Sub(session.ControllerSeenAt) > remoteControllerTTL:
 			session.State = "closed"
@@ -285,6 +287,7 @@ func (h *remoteHub) cleanupLocked(now time.Time) {
 			session.ClipboardText = ""
 			session.UpdatedAt = now
 			notifyRemoteSession(session.FrameReady)
+			notifyRemoteSession(session.InputReady)
 			notifyRemoteSession(session.ClipboardReady)
 		case session.State != "pending" && session.State != "active" && now.Sub(session.UpdatedAt) > remoteSessionTTL:
 			delete(h.sessions, id)
@@ -459,7 +462,7 @@ func (s *Server) remoteCreateSession(w http.ResponseWriter, r *http.Request) {
 		ControllerSSHPublicKey: request.ControllerSSHPublicKey,
 		State:                  "pending", CreatedAt: now, UpdatedAt: now, ControllerSeenAt: now,
 		Quality: request.Quality, ClipboardEnabled: request.ClipboardEnabled,
-		FrameReady: make(chan struct{}, 1), ClipboardReady: make(chan struct{}, 1),
+		FrameReady: make(chan struct{}, 1), InputReady: make(chan struct{}, 1), ClipboardReady: make(chan struct{}, 1),
 	}
 	s.remote.sessions[id] = session
 	view := viewRemoteSession(session)
@@ -539,8 +542,10 @@ func (s *Server) remoteUpdateSessionSettings(w http.ResponseWriter, r *http.Requ
 		notifyRemoteSession(session.ClipboardReady)
 	}
 	session.ClipboardEnabled = request.ClipboardEnabled
+	session.InputSequence++
 	session.ControllerSeenAt = time.Now()
 	session.UpdatedAt = time.Now()
+	notifyRemoteSession(session.InputReady)
 	view := viewRemoteSession(session)
 	s.remote.mu.Unlock()
 	writeJSON(w, http.StatusOK, view)
@@ -612,6 +617,7 @@ func (s *Server) remoteCloseSession(w http.ResponseWriter, r *http.Request) {
 		session.ClipboardText = ""
 		session.UpdatedAt = time.Now()
 		notifyRemoteSession(session.FrameReady)
+		notifyRemoteSession(session.InputReady)
 		notifyRemoteSession(session.ClipboardReady)
 	}
 	s.remote.mu.Unlock()
@@ -814,12 +820,17 @@ func (s *Server) remotePostInputs(w http.ResponseWriter, r *http.Request) {
 			session.Inputs = filtered
 		}
 		session.InputSequence++
+		if event.Type == "move" && len(session.Inputs) > 0 && session.Inputs[len(session.Inputs)-1].Event.Type == "move" {
+			session.Inputs[len(session.Inputs)-1] = sequencedRemoteInput{Sequence: session.InputSequence, Event: event}
+			continue
+		}
 		session.Inputs = append(session.Inputs, sequencedRemoteInput{Sequence: session.InputSequence, Event: event})
 	}
 	if len(session.Inputs) > remoteInputQueueCap {
 		session.Inputs = session.Inputs[len(session.Inputs)-remoteInputQueueCap:]
 	}
 	session.UpdatedAt = time.Now()
+	notifyRemoteSession(session.InputReady)
 	sequence := session.InputSequence
 	s.remote.mu.Unlock()
 	writeJSON(w, http.StatusAccepted, map[string]uint64{"sequence": sequence})
@@ -848,18 +859,39 @@ func (s *Server) remotePollInputs(w http.ResponseWriter, r *http.Request) {
 		}
 		events := remoteInputEventsAfter(session, after)
 		state, sequence := session.State, session.InputSequence
+		quality, clipboardEnabled := session.Quality, session.ClipboardEnabled
+		inputReady := session.InputReady
 		if len(events) > 0 {
 			session.UpdatedAt = time.Now()
+			select {
+			case <-inputReady:
+			default:
+			}
 		}
 		s.remote.mu.Unlock()
-		if len(events) > 0 || state != "active" || time.Now().After(deadline) {
-			writeJSON(w, http.StatusOK, map[string]any{"sequence": sequence, "state": state, "events": events})
+		if sequence > after || state != "active" || time.Now().After(deadline) {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"sequence": sequence, "state": state, "events": events,
+				"quality": quality, "clipboardEnabled": clipboardEnabled,
+			})
 			return
 		}
+		wait := time.Until(deadline)
+		if wait <= 0 {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"sequence": sequence, "state": state, "events": events,
+				"quality": quality, "clipboardEnabled": clipboardEnabled,
+			})
+			return
+		}
+		timer := time.NewTimer(wait)
 		select {
 		case <-r.Context().Done():
+			timer.Stop()
 			return
-		case <-time.After(50 * time.Millisecond):
+		case <-inputReady:
+			timer.Stop()
+		case <-timer.C:
 		}
 	}
 }
