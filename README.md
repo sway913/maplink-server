@@ -12,7 +12,7 @@ MapLink Server 是映链 MapLink 的自托管服务端。它运行官方原版 `
 - FRP 原生 Dashboard 只监听 `127.0.0.1`，服务端仅代理允许的只读接口。
 - 为 MapLink 客户端提供带 HMAC 校验的在线设备与远程控制中转接口。
 - 提供一次性配对码、每设备独立凭据、设备重命名与即时撤销；旧版共享 Token 客户端继续兼容。
-- 远程会话、画面和输入队列只保存在内存中，过期后自动清理。
+- 远程会话、画面、输入与剪贴板文本只保存在内存中，过期后自动清理；支持 720P/30、1080P/60 和 4K/60 画质协商。
 - 只中转 MapLink 专用 SSH 公钥；不接收、不保存 SSH 私钥和登录密码。
 - 支持 Linux x86-64 与 ARM64，发行包内置匹配版本的官方 `frps`。
 
@@ -48,8 +48,8 @@ MapLink Server 不替换或修改 FRP 协议。端口映射仍由官方 `frps`/`
 2. 解压并以 root 运行安装脚本：
 
 ```bash
-tar -xzf maplink-server-v0.7.1-linux-amd64.tar.gz
-cd maplink-server-v0.7.1-linux-amd64
+tar -xzf maplink-server-v0.8.0-linux-amd64.tar.gz
+cd maplink-server-v0.8.0-linux-amd64
 sudo ./scripts/install.sh --public-ip 203.0.113.10
 ```
 
