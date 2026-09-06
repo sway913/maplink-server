@@ -48,8 +48,8 @@ MapLink Server 不替换或修改 FRP 协议。端口映射仍由官方 `frps`/`
 2. 解压并以 root 运行安装脚本：
 
 ```bash
-tar -xzf maplink-server-v0.7.0-linux-amd64.tar.gz
-cd maplink-server-v0.7.0-linux-amd64
+tar -xzf maplink-server-v0.7.1-linux-amd64.tar.gz
+cd maplink-server-v0.7.1-linux-amd64
 sudo ./scripts/install.sh --public-ip 203.0.113.10
 ```
 

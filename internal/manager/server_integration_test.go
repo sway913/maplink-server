@@ -56,7 +56,7 @@ func TestServerCanLoadAdminHashFromExistingFileWithoutEnvironmentCopy(t *testing
 	}
 	server, err := NewServer(ServerOptions{
 		Store: &Store{
-			StatePath: filepath.Join(dir, "state.json"),
+			StatePath:  filepath.Join(dir, "state.json"),
 			ConfigPath: filepath.Join(dir, "frps.toml"),
 			Runner:     &fakeRunner{},
 		},
@@ -182,7 +182,7 @@ func TestHealthAdvertisesRemoteControlRelay(t *testing.T) {
 	server := integrationServer(t)
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/health", nil))
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"remote-control"`) || !strings.Contains(response.Body.String(), `"version":"0.6.1"`) {
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"remote-control"`) || !strings.Contains(response.Body.String(), `"version":"0.7.1"`) {
 		t.Fatalf("health endpoint does not advertise remote control: %d %s", response.Code, response.Body.String())
 	}
 }
@@ -272,6 +272,55 @@ func TestRemoteRelayAuthenticatesAndMovesFramesAndInputWithoutPersistence(t *tes
 	closed := remoteRelayRequest(t, server, http.MethodDelete, closePath, nil, "close-session-nonce1")
 	if closed.Code != http.StatusNoContent {
 		t.Fatalf("session close failed: %d %s", closed.Code, closed.Body.String())
+	}
+}
+
+func TestRemoteRelayReleasesActiveSessionWhenControllerLeaseExpires(t *testing.T) {
+	server := integrationServer(t)
+	heartbeat := []byte(`{"deviceID":"office-pc","name":"Office PC","platform":"windows","permission":"ready"}`)
+	response := remoteRelayRequest(t, server, http.MethodPost, "/api/remote/hosts/heartbeat", heartbeat, "lease-heartbeat-0001")
+	if response.Code != http.StatusOK {
+		t.Fatalf("host heartbeat failed: %d %s", response.Code, response.Body.String())
+	}
+
+	createBody := []byte(`{"targetDeviceID":"office-pc","controllerDeviceID":"home-mac","controllerSSHPublicKey":""}`)
+	created := remoteRelayRequest(t, server, http.MethodPost, "/api/remote/sessions", createBody, "lease-create-nonce01")
+	if created.Code != http.StatusCreated {
+		t.Fatalf("session creation failed: %d %s", created.Code, created.Body.String())
+	}
+	var session remoteSessionView
+	if err := json.Unmarshal(created.Body.Bytes(), &session); err != nil {
+		t.Fatal(err)
+	}
+	acceptPath := "/api/remote/sessions/" + session.ID + "/accept"
+	acceptBody := []byte(`{"screenX":0,"screenY":0,"screenWidth":1920,"screenHeight":1080,"sshAuthorized":false,"error":""}`)
+	accepted := remoteRelayRequest(t, server, http.MethodPost, acceptPath, acceptBody, "lease-accept-nonce01")
+	if accepted.Code != http.StatusOK {
+		t.Fatalf("session acceptance failed: %d %s", accepted.Code, accepted.Body.String())
+	}
+
+	server.remote.mu.Lock()
+	active := server.remote.sessions[session.ID]
+	active.ControllerSeenAt = time.Now().Add(-remoteControllerTTL - time.Second)
+	active.UpdatedAt = time.Now()
+	active.Frame = []byte{0xff, 0xd8, 0xff, 0xd9}
+	server.remote.mu.Unlock()
+
+	response = remoteRelayRequest(t, server, http.MethodPost, "/api/remote/hosts/heartbeat", heartbeat, "lease-heartbeat-0002")
+	if response.Code != http.StatusOK {
+		t.Fatalf("host heartbeat cleanup failed: %d %s", response.Code, response.Body.String())
+	}
+	server.remote.mu.Lock()
+	if active.State != "closed" || active.Frame != nil {
+		server.remote.mu.Unlock()
+		t.Fatalf("stale controller session retained target resources: state=%s frame=%v", active.State, active.Frame)
+	}
+	server.remote.mu.Unlock()
+
+	reconnectBody := []byte(`{"targetDeviceID":"office-pc","controllerDeviceID":"backup-pc","controllerSSHPublicKey":""}`)
+	reconnected := remoteRelayRequest(t, server, http.MethodPost, "/api/remote/sessions", reconnectBody, "lease-reconnect-001")
+	if reconnected.Code != http.StatusCreated {
+		t.Fatalf("target remained busy after controller lease expired: %d %s", reconnected.Code, reconnected.Body.String())
 	}
 }
 
