@@ -68,6 +68,7 @@ func main() {
 		Store: store, System: system, AdminUser: env("FRP_MANAGER_ADMIN_USER", "admin"),
 		AdminHash: os.Getenv("FRP_MANAGER_ADMIN_HASH"), AdminHashPath: env("FRP_MANAGER_ADMIN_HASH_PATH", "/etc/frp-manager/admin-password.hash"), PublicIP: os.Getenv("FRP_MANAGER_PUBLIC_IP"),
 		WebRoot: env("FRP_MANAGER_WEB_ROOT", "/opt/frp-manager/web"), ManagerPort: port, SessionSecure: true,
+		DevicesPath: env("FRP_MANAGER_DEVICES", "/etc/frp-manager/devices.json"),
 	})
 	if err != nil {
 		log.Fatal(err)

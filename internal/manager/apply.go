@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 
 	"github.com/sway913/maplink-server/internal/frp"
@@ -74,11 +75,12 @@ func writeSecure(path string, data []byte, mode os.FileMode, gid int) error {
 	if err := temp.Close(); err != nil {
 		return err
 	}
-	// Windows does not replace an existing destination with os.Rename. Removing
-	// first keeps tests portable; the verified source and in-memory rollback data
-	// still ensure a failed service restart restores the previous configuration.
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+	// Unix rename atomically replaces the destination. Windows requires removing
+	// the destination first, so keep the portability fallback limited to Windows.
+	if runtime.GOOS == "windows" {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 	}
 	if err := os.Rename(tempName, path); err != nil {
 		return err

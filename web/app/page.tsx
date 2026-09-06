@@ -2,7 +2,7 @@
 
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 
-type Tab = 'overview' | 'clients' | 'ports' | 'credentials' | 'security' | 'logs';
+type Tab = 'overview' | 'devices' | 'clients' | 'ports' | 'credentials' | 'security' | 'logs';
 type PortRange = { start: number; end: number };
 type Config = {
   bindPort: number; kcpBindPort: number; quicBindPort: number;
@@ -19,10 +19,16 @@ type Credentials = {
   tcpConfig: string; kcpConfig: string; quicConfig: string;
 };
 type ListeningPort = { protocol: string; port: number; address: string };
+type Device = {
+  deviceID: string; name: string; platform: string; createdAt: string; lastSeen: string;
+  revoked: boolean; online: boolean; permission?: string; legacy: boolean;
+};
+type Pairing = { code: string; expiresAt: string };
 type JsonRecord = Record<string, unknown>;
 
 const navigation: { id: Tab; label: string; detail: string }[] = [
   { id: 'overview', label: '服务总览', detail: '运行状态与流量' },
+  { id: 'devices', label: '设备中心', detail: '配对、状态与撤销' },
   { id: 'clients', label: '客户端与代理', detail: '原生 FRP 监控' },
   { id: 'ports', label: '端口管理', detail: '监听与允许范围' },
   { id: 'credentials', label: '连接凭据', detail: 'Token 与配置' },
@@ -74,6 +80,12 @@ function rangesLabel(ranges?: PortRange[]) {
   return ranges?.map((range) => range.start === range.end ? `${range.start}` : `${range.start}–${range.end}`).join('，') || '未配置';
 }
 
+function formatTime(value?: string) {
+  if (!value || value.startsWith('0001-')) return '—';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString('zh-CN', { hour12: false });
+}
+
 async function jsonRequest<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
@@ -94,6 +106,9 @@ export default function Home() {
   const [credentials, setCredentials] = useState<Credentials | null>(null);
   const [serverInfo, setServerInfo] = useState<JsonRecord | null>(null);
   const [clients, setClients] = useState<JsonRecord[]>([]);
+  const [devices, setDevices] = useState<Device[]>([]);
+  const [allowLegacyRemoteAuth, setAllowLegacyRemoteAuth] = useState(true);
+  const [pairing, setPairing] = useState<Pairing | null>(null);
   const [proxies, setProxies] = useState<(JsonRecord & { proxyType?: string })[]>([]);
   const [listeningPorts, setListeningPorts] = useState<ListeningPort[]>([]);
   const [logs, setLogs] = useState('');
@@ -112,12 +127,13 @@ export default function Home() {
   const loadAll = useCallback(async () => {
     setLoading(true);
     setError('');
-    const [systemResult, configResult, credentialsResult, infoResult, clientsResult, portsResult, logsResult, ...proxyResults] = await Promise.allSettled([
+    const [systemResult, configResult, credentialsResult, infoResult, clientsResult, devicesResult, portsResult, logsResult, ...proxyResults] = await Promise.allSettled([
       jsonRequest<SystemInfo>('/api/system'),
       jsonRequest<Config>('/api/config'),
       jsonRequest<Credentials>('/api/credentials'),
       jsonRequest<JsonRecord>('/api/frp/serverinfo'),
       jsonRequest<unknown>('/api/frp/clients'),
+      jsonRequest<{ devices: Device[]; allowLegacyRemoteAuth: boolean }>('/api/devices'),
       jsonRequest<{ ports: ListeningPort[] }>('/api/ports'),
       jsonRequest<{ logs: string }>('/api/logs?lines=180'),
       ...proxyTypes.map((type) => jsonRequest<unknown>(`/api/frp/proxy/${type}`)),
@@ -127,6 +143,10 @@ export default function Home() {
     if (credentialsResult.status === 'fulfilled') { setCredentials(credentialsResult.value); setDeviceID(credentialsResult.value.deviceID); setConnectionPort(credentialsResult.value.serverPort); }
     if (infoResult.status === 'fulfilled') setServerInfo(infoResult.value);
     if (clientsResult.status === 'fulfilled') setClients(listFrom(clientsResult.value, ['clients', 'data']));
+    if (devicesResult.status === 'fulfilled') {
+      setDevices(devicesResult.value.devices || []);
+      setAllowLegacyRemoteAuth(devicesResult.value.allowLegacyRemoteAuth !== false);
+    }
     if (portsResult.status === 'fulfilled') setListeningPorts(portsResult.value.ports || []);
     if (logsResult.status === 'fulfilled') setLogs(logsResult.value.logs);
     const allProxies = proxyResults.flatMap((result, index) => result.status === 'fulfilled'
@@ -198,6 +218,48 @@ export default function Home() {
       setCredentials(next); notify(`${deviceID} 的配置已生成`);
     } catch (caught) { setError(caught instanceof Error ? caught.message : '生成设备配置失败'); }
     finally { setLoading(false); }
+  };
+
+  const createPairing = async () => {
+    setLoading(true); setError('');
+    try {
+      const next = await mutate<Pairing>('/api/devices/enrollments', {});
+      setPairing(next); notify('一次性配对码已生成');
+    } catch (caught) { setError(caught instanceof Error ? caught.message : '生成配对码失败'); }
+    finally { setLoading(false); }
+  };
+
+  const renameRegisteredDevice = async (device: Device) => {
+    if (device.legacy) return;
+    const name = prompt('输入新的设备名称', device.name)?.trim();
+    if (!name || name === device.name) return;
+    setLoading(true); setError('');
+    try {
+      await mutate(`/api/devices/${encodeURIComponent(device.deviceID)}`, { name }, 'PATCH');
+      notify('设备名称已更新'); await loadAll();
+    } catch (caught) { setError(caught instanceof Error ? caught.message : '修改设备名称失败'); setLoading(false); }
+  };
+
+  const revokeRegisteredDevice = async (device: Device) => {
+    if (device.legacy || !confirm(`确认撤销设备“${device.name}”？该设备的独立控制凭据会立即失效。`)) return;
+    setLoading(true); setError('');
+    try {
+      await mutate(`/api/devices/${encodeURIComponent(device.deviceID)}`, {}, 'DELETE');
+      notify('设备已撤销'); await loadAll();
+    } catch (caught) { setError(caught instanceof Error ? caught.message : '撤销设备失败'); setLoading(false); }
+  };
+
+  const toggleLegacyRemoteAuth = async () => {
+    const next = !allowLegacyRemoteAuth;
+    const prompt = next
+      ? '重新开启后，持有共享 Token 的旧客户端可访问远控 API。确认开启？'
+      : '关闭后，未完成配对的旧客户端将无法使用远程桌面，但 FRP 端口映射不受影响。确认所有需要远控的设备都已配对？';
+    if (!confirm(prompt)) return;
+    setLoading(true); setError('');
+    try {
+      await mutate('/api/devices/policy', { allowLegacyRemoteAuth: next }, 'PUT');
+      setAllowLegacyRemoteAuth(next); notify(next ? '旧版远控兼容已开启' : '旧版远控兼容已关闭'); await loadAll();
+    } catch (caught) { setError(caught instanceof Error ? caught.message : '修改设备策略失败'); setLoading(false); }
   };
 
   const changeAdminPassword = async (event: FormEvent<HTMLFormElement>) => {
@@ -287,6 +349,13 @@ export default function Home() {
               <article className="panel"><header><div><span className="eyebrow">LISTENING NOW</span><h3>监听端口</h3></div><button onClick={() => setActiveTab('ports')} type="button">管理</button></header><div className="port-chips">{listeningPorts.filter((port) => credentials?.controlPorts.includes(port.port) || [7100, 7400, 7500, 8080, 8443].includes(port.port)).map((port) => <span key={`${port.protocol}-${port.port}`}><i />{port.port}/{port.protocol.toUpperCase()}</span>)}</div><p className="panel-note">实际监听数据来自 Linux `ss`，不是静态配置推断。</p></article>
             </section>
           </>}
+
+          {activeTab === 'devices' && <section className="stack">
+            <div className="section-heading"><div><span className="eyebrow">DEVICE ENROLLMENT</span><h2>设备配对与访问控制</h2><p>新客户端使用一次性配对码获取独立控制凭据；撤销一台设备不会影响其他设备。</p></div><button className="primary" onClick={createPairing} disabled={loading} type="button">生成配对码</button></div>
+            {pairing && <article className="panel secret-panel"><header><div><span className="eyebrow">ONE-TIME CODE</span><h3>一次性设备配对码</h3></div><span className="safe-pill">10 分钟有效</span></header><div className="secret-value"><code>{pairing.code}</code><button className="primary" onClick={() => copy(pairing.code, '配对码')} type="button">复制配对码</button></div><p>在 MapLink Client 的“连接配置”中填写服务器地址、设备标识和此配对码。成功使用后立即失效；到期时间：{formatTime(pairing.expiresAt)}。</p></article>}
+            <article className="panel"><header><div><h3>旧版远控兼容</h3><p>关闭后，远控 API 只接受已配对设备的独立凭据，设备撤销无法再通过共享 Token 绕过；FRP 端口映射不受影响。</p></div><span className={`state-pill ${allowLegacyRemoteAuth ? 'bad' : ''}`}>{allowLegacyRemoteAuth ? '兼容已开启' : '强制独立凭据'}</span></header><button className={allowLegacyRemoteAuth ? 'primary' : ''} onClick={toggleLegacyRemoteAuth} disabled={loading} type="button">{allowLegacyRemoteAuth ? '所有设备已配对，关闭兼容' : '重新开启旧版兼容'}</button></article>
+            <article className="panel table-panel"><header><div><h3>设备列表</h3><p>已配对设备使用独立凭据；兼容设备仍使用旧版共享 Token。</p></div><span>{devices.length} 台设备</span></header>{devices.length ? <div className="table-wrap"><table><thead><tr><th>设备</th><th>平台</th><th>状态</th><th>凭据</th><th>最后在线</th><th>操作</th></tr></thead><tbody>{devices.map((device) => <tr key={device.deviceID}><td><strong>{device.name}</strong><br /><small>{device.deviceID}</small></td><td>{device.platform || '—'}</td><td><span className={`state-pill ${device.online ? '' : 'bad'}`}>{device.revoked ? '已撤销' : device.online ? '在线' : '离线'}</span></td><td>{device.legacy ? '共享 Token（兼容）' : '独立设备凭据'}</td><td>{formatTime(device.lastSeen)}</td><td><button onClick={() => renameRegisteredDevice(device)} disabled={device.legacy || device.revoked} type="button">重命名</button>{' '}<button className="danger-button" onClick={() => revokeRegisteredDevice(device)} disabled={device.legacy || device.revoked} type="button">撤销</button></td></tr>)}</tbody></table></div> : <EmptyState title="暂无设备" detail="生成配对码后，在 MapLink Client 中完成首次配对。" />}</article>
+          </section>}
 
           {activeTab === 'clients' && <section className="stack">
             <div className="section-heading"><div><span className="eyebrow">NATIVE FRP TELEMETRY</span><h2>客户端与代理</h2><p>Windows 与 macOS 使用相同的 FRP 协议，在线状态和代理都由原生仪表盘 API 统一管理。</p></div><div className="summary-badges"><span>{clientCount} 客户端</span><span>{proxyRows.length} 代理</span></div></div>

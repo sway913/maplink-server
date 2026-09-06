@@ -1,4 +1,8 @@
-MapLink Server 的 Linux x86-64 与 ARM64 发行包已通过完整 Go、Web 和敏感信息检查。
+MapLink Server v0.7.0 新增设备中心、一次性安全配对、每设备独立控制凭据、设备重命名与即时撤销。旧版共享 Token 远控默认兼容；全部设备配对后可一键关闭兼容，强制执行独立身份和撤销策略。
+
+升级安装会自动备份已有二进制、配置、Web 和 systemd unit；可迁移早期 `frp-manager.service` / `manager.env` 部署，失败时自动回滚。
+
+Linux x86-64 与 ARM64 发行包已通过完整 Go、Web、核心 E2E 和敏感信息检查。
 
 每个发行包包含：
 

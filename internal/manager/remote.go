@@ -94,6 +94,23 @@ type sequencedRemoteInput struct {
 	Event    remoteInput `json:"event"`
 }
 
+type remotePrincipal struct {
+	DeviceID string
+	Legacy   bool
+}
+
+func (principal remotePrincipal) allows(deviceIDs ...string) bool {
+	if principal.Legacy {
+		return true
+	}
+	for _, deviceID := range deviceIDs {
+		if principal.DeviceID == deviceID {
+			return true
+		}
+	}
+	return false
+}
+
 func newRemoteHub() *remoteHub {
 	return &remoteHub{
 		hosts:    make(map[string]remoteHost),
@@ -140,22 +157,40 @@ func remoteSignature(token, method, requestURI, timestamp, nonce string, body []
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-func (s *Server) authenticateRemoteRequest(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, bool) {
+func (s *Server) authenticateRemoteRequest(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, remotePrincipal, bool) {
 	settings, err := s.options.Store.Load()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
-		return nil, false
+		return nil, remotePrincipal{}, false
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
 	if err != nil {
 		writeError(w, http.StatusRequestEntityTooLarge, errors.New("远程控制请求过大"))
-		return nil, false
+		return nil, remotePrincipal{}, false
+	}
+	principal := remotePrincipal{Legacy: true}
+	credential := settings.Token
+	if deviceID := strings.TrimSpace(r.Header.Get("X-MapLink-Device-ID")); deviceID != "" {
+		if !validRemoteDeviceID(deviceID) {
+			writeError(w, http.StatusUnauthorized, errors.New("设备凭据无效"))
+			return nil, remotePrincipal{}, false
+		}
+		value, ok := s.devices.credential(deviceID)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, errors.New("设备未注册或已撤销"))
+			return nil, remotePrincipal{}, false
+		}
+		credential = value
+		principal = remotePrincipal{DeviceID: deviceID}
+	} else if !s.devices.legacyRemoteAuthAllowed() {
+		writeError(w, http.StatusUnauthorized, errors.New("旧版远控认证已关闭，请先完成设备配对"))
+		return nil, remotePrincipal{}, false
 	}
 	timestampText := r.Header.Get("X-MapLink-Timestamp")
 	nonce := r.Header.Get("X-MapLink-Nonce")
 	timestamp, timestampErr := strconv.ParseInt(timestampText, 10, 64)
 	provided, signatureErr := hex.DecodeString(r.Header.Get("X-MapLink-Signature"))
-	expected, _ := hex.DecodeString(remoteSignature(settings.Token, r.Method, r.URL.RequestURI(), timestampText, nonce, body))
+	expected, _ := hex.DecodeString(remoteSignature(credential, r.Method, r.URL.RequestURI(), timestampText, nonce, body))
 	age := time.Now().Unix() - timestamp
 	if age < 0 {
 		age = -age
@@ -163,7 +198,7 @@ func (s *Server) authenticateRemoteRequest(w http.ResponseWriter, r *http.Reques
 	if timestampErr != nil || signatureErr != nil || age > 120 || len(nonce) < 16 || len(nonce) > 96 ||
 		len(provided) != len(expected) || subtle.ConstantTimeCompare(provided, expected) != 1 {
 		writeError(w, http.StatusUnauthorized, errors.New("Token 无效"))
-		return nil, false
+		return nil, remotePrincipal{}, false
 	}
 
 	now := time.Now()
@@ -176,11 +211,19 @@ func (s *Server) authenticateRemoteRequest(w http.ResponseWriter, r *http.Reques
 	if _, replayed := s.remote.nonces[nonce]; replayed {
 		s.remote.mu.Unlock()
 		writeError(w, http.StatusUnauthorized, errors.New("请求已使用"))
-		return nil, false
+		return nil, remotePrincipal{}, false
 	}
 	s.remote.nonces[nonce] = now.Add(3 * time.Minute)
 	s.remote.mu.Unlock()
-	return body, true
+	return body, principal, true
+}
+
+func authorizeRemoteDevice(w http.ResponseWriter, principal remotePrincipal, deviceIDs ...string) bool {
+	if principal.allows(deviceIDs...) {
+		return true
+	}
+	writeError(w, http.StatusForbidden, errors.New("设备无权执行该远程操作"))
+	return false
 }
 
 func decodeRemoteJSON(w http.ResponseWriter, body []byte, value any) bool {
@@ -221,7 +264,7 @@ func viewRemoteSession(session *remoteSession) remoteSessionView {
 }
 
 func (s *Server) remoteHostHeartbeat(w http.ResponseWriter, r *http.Request) {
-	body, ok := s.authenticateRemoteRequest(w, r, remoteJSONLimit)
+	body, principal, ok := s.authenticateRemoteRequest(w, r, remoteJSONLimit)
 	if !ok {
 		return
 	}
@@ -243,10 +286,19 @@ func (s *Server) remoteHostHeartbeat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("远程主机信息无效"))
 		return
 	}
+	if !authorizeRemoteDevice(w, principal, request.DeviceID) {
+		return
+	}
 	if request.Name == "" {
 		request.Name = request.DeviceID
 	}
 	now := time.Now()
+	if !principal.Legacy {
+		if err := s.devices.touch(request.DeviceID, request.Platform, now.UTC()); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
 	s.remote.mu.Lock()
 	s.remote.cleanupLocked(now)
 	s.remote.hosts[request.DeviceID] = remoteHost{
@@ -259,7 +311,7 @@ func (s *Server) remoteHostHeartbeat(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) remoteDevices(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.authenticateRemoteRequest(w, r, remoteJSONLimit); !ok {
+	if _, _, ok := s.authenticateRemoteRequest(w, r, remoteJSONLimit); !ok {
 		return
 	}
 	now := time.Now()
@@ -276,12 +328,16 @@ func (s *Server) remoteDevices(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) remoteHostSessions(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.authenticateRemoteRequest(w, r, remoteJSONLimit); !ok {
+	_, principal, ok := s.authenticateRemoteRequest(w, r, remoteJSONLimit)
+	if !ok {
 		return
 	}
 	deviceID := r.PathValue("deviceID")
 	if !validRemoteDeviceID(deviceID) {
 		writeError(w, http.StatusBadRequest, errors.New("设备 ID 无效"))
+		return
+	}
+	if !authorizeRemoteDevice(w, principal, deviceID) {
 		return
 	}
 	now := time.Now()
@@ -298,7 +354,7 @@ func (s *Server) remoteHostSessions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) remoteCreateSession(w http.ResponseWriter, r *http.Request) {
-	body, ok := s.authenticateRemoteRequest(w, r, remoteJSONLimit)
+	body, principal, ok := s.authenticateRemoteRequest(w, r, remoteJSONLimit)
 	if !ok {
 		return
 	}
@@ -313,6 +369,9 @@ func (s *Server) remoteCreateSession(w http.ResponseWriter, r *http.Request) {
 	request.ControllerSSHPublicKey = strings.TrimSpace(request.ControllerSSHPublicKey)
 	if !validRemoteDeviceID(request.TargetDeviceID) || !validRemoteDeviceID(request.ControllerDeviceID) || request.TargetDeviceID == request.ControllerDeviceID || !validSSHPublicKey(request.ControllerSSHPublicKey) {
 		writeError(w, http.StatusBadRequest, errors.New("远程会话设备无效"))
+		return
+	}
+	if !authorizeRemoteDevice(w, principal, request.ControllerDeviceID) {
 		return
 	}
 	now := time.Now()
@@ -363,7 +422,8 @@ func (s *Server) withRemoteSession(w http.ResponseWriter, r *http.Request) (*rem
 }
 
 func (s *Server) remoteSessionStatus(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.authenticateRemoteRequest(w, r, remoteJSONLimit); !ok {
+	_, principal, ok := s.authenticateRemoteRequest(w, r, remoteJSONLimit)
+	if !ok {
 		return
 	}
 	s.remote.mu.Lock()
@@ -373,13 +433,17 @@ func (s *Server) remoteSessionStatus(w http.ResponseWriter, r *http.Request) {
 		s.remote.mu.Unlock()
 		return
 	}
+	if !authorizeRemoteDevice(w, principal, session.TargetDeviceID, session.ControllerDeviceID) {
+		s.remote.mu.Unlock()
+		return
+	}
 	view := viewRemoteSession(session)
 	s.remote.mu.Unlock()
 	writeJSON(w, http.StatusOK, view)
 }
 
 func (s *Server) remoteAcceptSession(w http.ResponseWriter, r *http.Request) {
-	body, ok := s.authenticateRemoteRequest(w, r, remoteJSONLimit)
+	body, principal, ok := s.authenticateRemoteRequest(w, r, remoteJSONLimit)
 	if !ok {
 		return
 	}
@@ -397,6 +461,10 @@ func (s *Server) remoteAcceptSession(w http.ResponseWriter, r *http.Request) {
 	s.remote.mu.Lock()
 	session, found := s.withRemoteSession(w, r)
 	if !found {
+		s.remote.mu.Unlock()
+		return
+	}
+	if !authorizeRemoteDevice(w, principal, session.TargetDeviceID) {
 		s.remote.mu.Unlock()
 		return
 	}
@@ -424,11 +492,16 @@ func (s *Server) remoteAcceptSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) remoteCloseSession(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.authenticateRemoteRequest(w, r, remoteJSONLimit); !ok {
+	_, principal, ok := s.authenticateRemoteRequest(w, r, remoteJSONLimit)
+	if !ok {
 		return
 	}
 	s.remote.mu.Lock()
 	if session := s.remote.sessions[r.PathValue("sessionID")]; session != nil {
+		if !authorizeRemoteDevice(w, principal, session.TargetDeviceID, session.ControllerDeviceID) {
+			s.remote.mu.Unlock()
+			return
+		}
 		session.State = "closed"
 		session.Frame = nil
 		session.Inputs = nil
@@ -439,7 +512,7 @@ func (s *Server) remoteCloseSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) remoteUploadFrame(w http.ResponseWriter, r *http.Request) {
-	body, ok := s.authenticateRemoteRequest(w, r, remoteFrameLimit)
+	body, principal, ok := s.authenticateRemoteRequest(w, r, remoteFrameLimit)
 	if !ok {
 		return
 	}
@@ -453,6 +526,10 @@ func (s *Server) remoteUploadFrame(w http.ResponseWriter, r *http.Request) {
 	s.remote.mu.Lock()
 	session, found := s.withRemoteSession(w, r)
 	if !found {
+		s.remote.mu.Unlock()
+		return
+	}
+	if !authorizeRemoteDevice(w, principal, session.TargetDeviceID) {
 		s.remote.mu.Unlock()
 		return
 	}
@@ -472,7 +549,8 @@ func (s *Server) remoteUploadFrame(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) remoteDownloadFrame(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.authenticateRemoteRequest(w, r, remoteJSONLimit); !ok {
+	_, principal, ok := s.authenticateRemoteRequest(w, r, remoteJSONLimit)
+	if !ok {
 		return
 	}
 	after, _ := strconv.ParseUint(r.URL.Query().Get("after"), 10, 64)
@@ -481,6 +559,10 @@ func (s *Server) remoteDownloadFrame(w http.ResponseWriter, r *http.Request) {
 		s.remote.mu.Lock()
 		session, found := s.withRemoteSession(w, r)
 		if !found {
+			s.remote.mu.Unlock()
+			return
+		}
+		if !authorizeRemoteDevice(w, principal, session.ControllerDeviceID) {
 			s.remote.mu.Unlock()
 			return
 		}
@@ -526,7 +608,7 @@ func validRemoteInput(event remoteInput) bool {
 }
 
 func (s *Server) remotePostInputs(w http.ResponseWriter, r *http.Request) {
-	body, ok := s.authenticateRemoteRequest(w, r, remoteJSONLimit)
+	body, principal, ok := s.authenticateRemoteRequest(w, r, remoteJSONLimit)
 	if !ok {
 		return
 	}
@@ -552,6 +634,10 @@ func (s *Server) remotePostInputs(w http.ResponseWriter, r *http.Request) {
 		s.remote.mu.Unlock()
 		return
 	}
+	if !authorizeRemoteDevice(w, principal, session.ControllerDeviceID) {
+		s.remote.mu.Unlock()
+		return
+	}
 	if session.State != "active" {
 		s.remote.mu.Unlock()
 		writeError(w, http.StatusConflict, errors.New("远程会话未激活"))
@@ -571,7 +657,8 @@ func (s *Server) remotePostInputs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) remotePollInputs(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.authenticateRemoteRequest(w, r, remoteJSONLimit); !ok {
+	_, principal, ok := s.authenticateRemoteRequest(w, r, remoteJSONLimit)
+	if !ok {
 		return
 	}
 	after, _ := strconv.ParseUint(r.URL.Query().Get("after"), 10, 64)
@@ -583,6 +670,10 @@ func (s *Server) remotePollInputs(w http.ResponseWriter, r *http.Request) {
 		s.remote.mu.Lock()
 		session, found := s.withRemoteSession(w, r)
 		if !found {
+			s.remote.mu.Unlock()
+			return
+		}
+		if !authorizeRemoteDevice(w, principal, session.TargetDeviceID) {
 			s.remote.mu.Unlock()
 			return
 		}
