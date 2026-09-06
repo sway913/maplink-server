@@ -182,7 +182,7 @@ func TestHealthAdvertisesRemoteControlRelay(t *testing.T) {
 	server := integrationServer(t)
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/health", nil))
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"remote-control"`) || !strings.Contains(response.Body.String(), `"version":"0.8.0"`) {
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"remote-control"`) || !strings.Contains(response.Body.String(), `"version":"0.8.1"`) {
 		t.Fatalf("health endpoint does not advertise remote control: %d %s", response.Code, response.Body.String())
 	}
 }
@@ -258,7 +258,7 @@ func TestRemoteRelayAuthenticatesAndMovesFramesAndInputWithoutPersistence(t *tes
 	}
 
 	inputPath := "/api/remote/sessions/" + session.ID + "/inputs"
-	postedInput := remoteRelayRequest(t, server, http.MethodPost, inputPath, []byte(`{"events":[{"type":"move","x":0.25,"y":0.75},{"type":"button","x":0.25,"y":0.75,"button":0,"down":true}]}`), "post-input-nonce001")
+	postedInput := remoteRelayRequest(t, server, http.MethodPost, inputPath, []byte(`{"events":[{"type":"move","x":0.1,"y":0.2},{"type":"move","x":0.25,"y":0.75},{"type":"button","x":0.25,"y":0.75,"button":0,"down":true}]}`), "post-input-nonce001")
 	if postedInput.Code != http.StatusAccepted {
 		t.Fatalf("input posting failed: %d %s", postedInput.Code, postedInput.Body.String())
 	}
@@ -269,19 +269,32 @@ func TestRemoteRelayAuthenticatesAndMovesFramesAndInputWithoutPersistence(t *tes
 	server.remote.mu.Lock()
 	clipboardInputs := 0
 	clipboardText := ""
+	moveInputs := 0
+	moveX := 0.0
 	for _, queued := range server.remote.sessions[session.ID].Inputs {
 		if queued.Event.Type == "clipboard" {
 			clipboardInputs++
 			clipboardText = queued.Event.Text
 		}
+		if queued.Event.Type == "move" {
+			moveInputs++
+			moveX = queued.Event.X
+		}
 	}
+	inputNotificationPending := len(server.remote.sessions[session.ID].InputReady) == 1
 	server.remote.mu.Unlock()
 	if clipboardInputs != 1 || clipboardText != "latest" {
 		t.Fatalf("clipboard input queue was not coalesced: count=%d text=%q", clipboardInputs, clipboardText)
 	}
+	if moveInputs != 1 || moveX != 0.25 {
+		t.Fatalf("consecutive pointer moves were not coalesced: count=%d x=%f", moveInputs, moveX)
+	}
+	if !inputNotificationPending {
+		t.Fatal("input posting did not notify a waiting target")
+	}
 	pollPath := inputPath + "?after=0&wait=0"
 	polledInput := remoteRelayRequest(t, server, http.MethodGet, pollPath, nil, "poll-input-nonce001")
-	if polledInput.Code != http.StatusOK || !strings.Contains(polledInput.Body.String(), `"type":"button"`) {
+	if polledInput.Code != http.StatusOK || !strings.Contains(polledInput.Body.String(), `"type":"button"`) || !strings.Contains(polledInput.Body.String(), `"quality":"1080p60"`) {
 		t.Fatalf("input polling failed: %d %s", polledInput.Code, polledInput.Body.String())
 	}
 
@@ -301,9 +314,32 @@ func TestRemoteRelayAuthenticatesAndMovesFramesAndInputWithoutPersistence(t *tes
 	}
 
 	settingsPath := "/api/remote/sessions/" + session.ID + "/settings"
+	server.remote.mu.Lock()
+	settingsAfter := server.remote.sessions[session.ID].InputSequence
+	server.remote.mu.Unlock()
+	settingsPollPath := inputPath + "?after=" + strconv.FormatUint(settingsAfter, 10)
+	settingsPollTimestamp := strconv.FormatInt(time.Now().Unix(), 10)
+	settingsPollRequest := httptest.NewRequest(http.MethodGet, settingsPollPath, nil)
+	settingsPollRequest.Header.Set("X-MapLink-Timestamp", settingsPollTimestamp)
+	settingsPollRequest.Header.Set("X-MapLink-Nonce", "settings-poll-nonce1")
+	settingsPollRequest.Header.Set("X-MapLink-Signature", remoteSignature("0123456789abcdef", http.MethodGet, settingsPollPath, settingsPollTimestamp, "settings-poll-nonce1", nil))
+	settingsPollResponse := httptest.NewRecorder()
+	settingsPollDone := make(chan struct{})
+	go func() {
+		server.Handler().ServeHTTP(settingsPollResponse, settingsPollRequest)
+		close(settingsPollDone)
+	}()
 	updatedSettings := remoteRelayRequest(t, server, http.MethodPatch, settingsPath, []byte(`{"quality":"4k60","clipboardEnabled":true}`), "session-settings-001")
 	if updatedSettings.Code != http.StatusOK || !strings.Contains(updatedSettings.Body.String(), `"quality":"4k60"`) {
 		t.Fatalf("session settings update failed: %d %s", updatedSettings.Code, updatedSettings.Body.String())
+	}
+	select {
+	case <-settingsPollDone:
+		if settingsPollResponse.Code != http.StatusOK || !strings.Contains(settingsPollResponse.Body.String(), `"quality":"4k60"`) {
+			t.Fatalf("settings did not wake input poll: %d %s", settingsPollResponse.Code, settingsPollResponse.Body.String())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("settings update did not promptly wake input poll")
 	}
 	invalidSettings := remoteRelayRequest(t, server, http.MethodPatch, settingsPath, []byte(`{"quality":"unlimited","clipboardEnabled":true}`), "session-settings-002")
 	if invalidSettings.Code != http.StatusBadRequest {
