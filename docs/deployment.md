@@ -20,6 +20,7 @@
 | `/opt/frp-manager/web` | 管理后台静态文件 |
 | `/etc/frp/frps.toml` | `frps` 生效配置 |
 | `/etc/frp-manager/state.json` | MapLink Server 配置状态，包含 Token |
+| `/etc/frp-manager/devices.json` | 已配对设备及其独立凭据 |
 | `/etc/frp-manager/admin-password.hash` | 管理密码哈希 |
 | `/etc/frp-manager/server.env` | 服务环境配置 |
 | `/etc/frp-manager/tls.crt` | HTTPS 证书 |
@@ -79,6 +80,7 @@ curl -k https://127.0.0.1:7400/api/health
 
 ```text
 /etc/frp-manager/state.json
+/etc/frp-manager/devices.json
 /etc/frp-manager/admin-password.hash
 /etc/frp-manager/server.env
 /etc/frp-manager/tls.crt
@@ -86,11 +88,13 @@ curl -k https://127.0.0.1:7400/api/health
 /etc/frp/frps.toml
 ```
 
-`state.json` 包含客户端 Token，应按敏感凭据保存。不要提交到 GitHub。
+`state.json` 与 `devices.json` 都包含客户端凭据，应按敏感数据保存。不要提交到 GitHub。
 
 ## 升级
 
-下载新发行包并再次执行其中的安装脚本。已有状态、密码哈希和证书不会被覆盖，二进制、Web 页面和 systemd unit 会更新，然后服务自动重启。
+下载新发行包并再次执行其中的安装脚本。安装程序会先在 `/var/backups/maplink-server/<时间戳>` 创建备份；已有状态、设备注册表、密码哈希和证书不会被覆盖，二进制、Web 页面和 systemd unit 会更新，然后服务自动重启。升级失败时会自动恢复上一版本。
+
+从旧版 `frp-manager.service` 升级时，安装程序会迁移到 `maplink-server.service`，并将旧 `manager.env` 合并到 `server.env`。首次升级到 v0.7.0 后，旧客户端仍可使用共享 Token，新客户端可逐台通过设备中心完成配对。所有远控设备迁移完成后，应在设备中心关闭旧版远控兼容，使撤销策略不可由共享 Token 绕过。
 
 升级前建议先备份 `/etc/frp-manager` 和 `/etc/frp`。升级后检查：
 

@@ -22,6 +22,11 @@ test('服务端控制台统一使用 MapLink 品牌和新图标', async () => {
   assert.match(page, /macOS（Apple 芯片）/);
   assert.match(page, /Windows x64/);
   assert.match(page, /统一接入和管理/);
+  assert.match(page, /设备配对与访问控制/);
+  assert.match(page, /api\/devices\/enrollments/);
+  assert.match(page, /独立设备凭据/);
+  assert.match(page, /api\/devices\/policy/);
+  assert.match(page, /关闭兼容/);
   assert.doesNotMatch(page, />FRP Manager</);
   assert.doesNotMatch(page, /brand-mark">F</);
   assert.match(styles, /maplink-icon\.png/);

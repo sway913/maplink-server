@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -37,6 +38,7 @@ type ServerOptions struct {
 	WebRoot       string
 	ManagerPort   int
 	SessionSecure bool
+	DevicesPath   string
 }
 
 type session struct {
@@ -59,6 +61,9 @@ type Server struct {
 	sessions      map[string]session
 	attempts      map[string]attempt
 	remote        *remoteHub
+	devices       *deviceRegistry
+	enrollmentsMu sync.Mutex
+	enrollments   map[string]pendingEnrollment
 }
 
 func randomToken(bytes int) (string, error) {
@@ -98,14 +103,23 @@ func NewServer(options ServerOptions) (*Server, error) {
 	if options.ManagerPort == 0 {
 		options.ManagerPort = 7400
 	}
+	if options.DevicesPath == "" {
+		options.DevicesPath = filepath.Join(filepath.Dir(options.Store.StatePath), "devices.json")
+	}
+	devices, err := loadDeviceRegistry(options.DevicesPath)
+	if err != nil {
+		return nil, err
+	}
 	server := &Server{
-		options:   options,
-		mux:       http.NewServeMux(),
-		client:    &http.Client{Timeout: 8 * time.Second},
-		adminHash: adminHash,
-		sessions:  map[string]session{},
-		attempts:  map[string]attempt{},
-		remote:    newRemoteHub(),
+		options:     options,
+		mux:         http.NewServeMux(),
+		client:      &http.Client{Timeout: 8 * time.Second},
+		adminHash:   adminHash,
+		sessions:    map[string]session{},
+		attempts:    map[string]attempt{},
+		remote:      newRemoteHub(),
+		devices:     devices,
+		enrollments: make(map[string]pendingEnrollment),
 	}
 	server.routes()
 	return server, nil
@@ -125,6 +139,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/logs", s.authenticated(s.logs))
 	s.mux.HandleFunc("GET /api/ports", s.authenticated(s.ports))
 	s.mux.HandleFunc("GET /api/frp/{resource...}", s.authenticated(s.frpAPI))
+	s.mux.HandleFunc("GET /api/devices", s.authenticated(s.deviceList))
+	s.mux.HandleFunc("POST /api/devices/enrollments", s.authenticated(s.requireCSRF(s.createDeviceEnrollment)))
+	s.mux.HandleFunc("PUT /api/devices/policy", s.authenticated(s.requireCSRF(s.updateDevicePolicy)))
+	s.mux.HandleFunc("PATCH /api/devices/{deviceID}", s.authenticated(s.requireCSRF(s.renameDevice)))
+	s.mux.HandleFunc("DELETE /api/devices/{deviceID}", s.authenticated(s.requireCSRF(s.revokeDevice)))
+	s.mux.HandleFunc("POST /api/client/enroll", s.clientEnroll)
 	s.mux.HandleFunc("GET /api/client/devices", s.onlineSSHDevices)
 	s.mux.HandleFunc("GET /api/remote/devices", s.remoteDevices)
 	s.mux.HandleFunc("POST /api/remote/hosts/heartbeat", s.remoteHostHeartbeat)
@@ -141,7 +161,7 @@ func (s *Server) routes() {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status":   "ok",
 			"version":  version.Value,
-			"features": []string{"remote-control"},
+			"features": []string{"remote-control", "device-enrollment", "device-auth"},
 		})
 	})
 	if s.options.WebRoot != "" {
