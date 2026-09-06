@@ -19,14 +19,15 @@ import (
 )
 
 const (
-	remoteHostTTL       = 30 * time.Second
-	remotePendingTTL    = 35 * time.Second
-	remoteControllerTTL = 30 * time.Second
-	remoteSessionTTL    = 90 * time.Second
-	remoteFrameLimit    = 3 << 20
-	remoteJSONLimit     = 128 << 10
-	remoteLongPoll      = 18 * time.Second
-	remoteInputQueueCap = 256
+	remoteHostTTL        = 30 * time.Second
+	remotePendingTTL     = 35 * time.Second
+	remoteControllerTTL  = 30 * time.Second
+	remoteSessionTTL     = 90 * time.Second
+	remoteFrameLimit     = 16 << 20
+	remoteJSONLimit      = 128 << 10
+	remoteClipboardLimit = 64 << 10
+	remoteLongPoll       = 18 * time.Second
+	remoteInputQueueCap  = 256
 )
 
 type remoteHub struct {
@@ -63,6 +64,12 @@ type remoteSession struct {
 	Frame                  []byte
 	InputSequence          uint64
 	Inputs                 []sequencedRemoteInput
+	Quality                string
+	ClipboardEnabled       bool
+	ClipboardSequence      uint64
+	ClipboardText          string
+	FrameReady             chan struct{}
+	ClipboardReady         chan struct{}
 }
 
 type remoteSessionView struct {
@@ -78,6 +85,9 @@ type remoteSessionView struct {
 	ScreenWidth            int    `json:"screenWidth"`
 	ScreenHeight           int    `json:"screenHeight"`
 	FrameSequence          uint64 `json:"frameSequence"`
+	Quality                string `json:"quality"`
+	ClipboardEnabled       bool   `json:"clipboardEnabled"`
+	ClipboardSequence      uint64 `json:"clipboardSequence"`
 }
 
 type remoteInput struct {
@@ -90,6 +100,7 @@ type remoteInput struct {
 	Key    string  `json:"key,omitempty"`
 	Code   string  `json:"code,omitempty"`
 	Down   bool    `json:"down,omitempty"`
+	Text   string  `json:"text,omitempty"`
 }
 
 type sequencedRemoteInput struct {
@@ -243,6 +254,13 @@ func decodeRemoteJSON(w http.ResponseWriter, body []byte, value any) bool {
 	return true
 }
 
+func notifyRemoteSession(channel chan struct{}) {
+	select {
+	case channel <- struct{}{}:
+	default:
+	}
+}
+
 func (h *remoteHub) cleanupLocked(now time.Time) {
 	for id, host := range h.hosts {
 		if now.Sub(host.LastSeen) > remoteHostTTL {
@@ -256,12 +274,18 @@ func (h *remoteHub) cleanupLocked(now time.Time) {
 			session.Error = "对方设备响应超时"
 			session.Frame = nil
 			session.Inputs = nil
+			session.ClipboardText = ""
 			session.UpdatedAt = now
+			notifyRemoteSession(session.FrameReady)
+			notifyRemoteSession(session.ClipboardReady)
 		case session.State == "active" && now.Sub(session.ControllerSeenAt) > remoteControllerTTL:
 			session.State = "closed"
 			session.Frame = nil
 			session.Inputs = nil
+			session.ClipboardText = ""
 			session.UpdatedAt = now
+			notifyRemoteSession(session.FrameReady)
+			notifyRemoteSession(session.ClipboardReady)
 		case session.State != "pending" && session.State != "active" && now.Sub(session.UpdatedAt) > remoteSessionTTL:
 			delete(h.sessions, id)
 		}
@@ -275,7 +299,12 @@ func viewRemoteSession(session *remoteSession) remoteSessionView {
 		SSHAuthorized:          session.SSHAuthorized,
 		State:                  session.State, Error: session.Error, ScreenX: session.ScreenX, ScreenY: session.ScreenY,
 		ScreenWidth: session.ScreenWidth, ScreenHeight: session.ScreenHeight, FrameSequence: session.FrameSequence,
+		Quality: session.Quality, ClipboardEnabled: session.ClipboardEnabled, ClipboardSequence: session.ClipboardSequence,
 	}
+}
+
+func validRemoteQuality(value string) bool {
+	return value == "720p30" || value == "1080p60" || value == "4k60"
 }
 
 func (s *Server) remoteHostHeartbeat(w http.ResponseWriter, r *http.Request) {
@@ -377,13 +406,22 @@ func (s *Server) remoteCreateSession(w http.ResponseWriter, r *http.Request) {
 		TargetDeviceID         string `json:"targetDeviceID"`
 		ControllerDeviceID     string `json:"controllerDeviceID"`
 		ControllerSSHPublicKey string `json:"controllerSSHPublicKey"`
+		Quality                string `json:"quality"`
+		ClipboardEnabled       bool   `json:"clipboardEnabled"`
 	}
 	if !decodeRemoteJSON(w, body, &request) {
 		return
 	}
 	request.ControllerSSHPublicKey = strings.TrimSpace(request.ControllerSSHPublicKey)
+	if request.Quality == "" {
+		request.Quality = "720p30"
+	}
 	if !validRemoteDeviceID(request.TargetDeviceID) || !validRemoteDeviceID(request.ControllerDeviceID) || request.TargetDeviceID == request.ControllerDeviceID || !validSSHPublicKey(request.ControllerSSHPublicKey) {
 		writeError(w, http.StatusBadRequest, errors.New("远程会话设备无效"))
+		return
+	}
+	if !validRemoteQuality(request.Quality) {
+		writeError(w, http.StatusBadRequest, errors.New("远程画质选项无效"))
 		return
 	}
 	if !authorizeRemoteDevice(w, principal, request.ControllerDeviceID) {
@@ -420,6 +458,8 @@ func (s *Server) remoteCreateSession(w http.ResponseWriter, r *http.Request) {
 		ID: id, TargetDeviceID: request.TargetDeviceID, ControllerDeviceID: request.ControllerDeviceID,
 		ControllerSSHPublicKey: request.ControllerSSHPublicKey,
 		State:                  "pending", CreatedAt: now, UpdatedAt: now, ControllerSeenAt: now,
+		Quality: request.Quality, ClipboardEnabled: request.ClipboardEnabled,
+		FrameReady: make(chan struct{}, 1), ClipboardReady: make(chan struct{}, 1),
 	}
 	s.remote.sessions[id] = session
 	view := viewRemoteSession(session)
@@ -455,6 +495,52 @@ func (s *Server) remoteSessionStatus(w http.ResponseWriter, r *http.Request) {
 	if principal.Legacy || principal.DeviceID == session.ControllerDeviceID {
 		session.ControllerSeenAt = time.Now()
 	}
+	view := viewRemoteSession(session)
+	s.remote.mu.Unlock()
+	writeJSON(w, http.StatusOK, view)
+}
+
+func (s *Server) remoteUpdateSessionSettings(w http.ResponseWriter, r *http.Request) {
+	body, principal, ok := s.authenticateRemoteRequest(w, r, remoteJSONLimit)
+	if !ok {
+		return
+	}
+	var request struct {
+		Quality          string `json:"quality"`
+		ClipboardEnabled bool   `json:"clipboardEnabled"`
+	}
+	if !decodeRemoteJSON(w, body, &request) {
+		return
+	}
+	if !validRemoteQuality(request.Quality) {
+		writeError(w, http.StatusBadRequest, errors.New("远程画质选项无效"))
+		return
+	}
+	s.remote.mu.Lock()
+	s.remote.cleanupLocked(time.Now())
+	session, found := s.withRemoteSession(w, r)
+	if !found {
+		s.remote.mu.Unlock()
+		return
+	}
+	if !authorizeRemoteDevice(w, principal, session.ControllerDeviceID) {
+		s.remote.mu.Unlock()
+		return
+	}
+	if session.State != "pending" && session.State != "active" {
+		s.remote.mu.Unlock()
+		writeError(w, http.StatusConflict, errors.New("远程会话已结束"))
+		return
+	}
+	session.Quality = request.Quality
+	if session.ClipboardEnabled && !request.ClipboardEnabled {
+		session.ClipboardText = ""
+		session.ClipboardSequence++
+		notifyRemoteSession(session.ClipboardReady)
+	}
+	session.ClipboardEnabled = request.ClipboardEnabled
+	session.ControllerSeenAt = time.Now()
+	session.UpdatedAt = time.Now()
 	view := viewRemoteSession(session)
 	s.remote.mu.Unlock()
 	writeJSON(w, http.StatusOK, view)
@@ -523,7 +609,10 @@ func (s *Server) remoteCloseSession(w http.ResponseWriter, r *http.Request) {
 		session.State = "closed"
 		session.Frame = nil
 		session.Inputs = nil
+		session.ClipboardText = ""
 		session.UpdatedAt = time.Now()
+		notifyRemoteSession(session.FrameReady)
+		notifyRemoteSession(session.ClipboardReady)
 	}
 	s.remote.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
@@ -537,7 +626,17 @@ func (s *Server) remoteUploadFrame(w http.ResponseWriter, r *http.Request) {
 	sequence, sequenceErr := strconv.ParseUint(r.Header.Get("X-MapLink-Sequence"), 10, 64)
 	width, widthErr := strconv.Atoi(r.Header.Get("X-MapLink-Width"))
 	height, heightErr := strconv.Atoi(r.Header.Get("X-MapLink-Height"))
-	if sequenceErr != nil || widthErr != nil || heightErr != nil || sequence == 0 || width < 1 || height < 1 || len(body) < 4 {
+	inputAfterText, combinedResponse := r.URL.Query()["inputAfter"]
+	var inputAfter uint64
+	var inputAfterErr error
+	if combinedResponse {
+		if len(inputAfterText) != 1 {
+			inputAfterErr = errors.New("invalid input sequence")
+		} else {
+			inputAfter, inputAfterErr = strconv.ParseUint(inputAfterText[0], 10, 64)
+		}
+	}
+	if sequenceErr != nil || widthErr != nil || heightErr != nil || inputAfterErr != nil || sequence == 0 || width < 1 || height < 1 || width > 3840 || height > 2160 || width*height > 3840*2160 || len(body) < 4 {
 		writeError(w, http.StatusBadRequest, errors.New("远程画面参数无效"))
 		return
 	}
@@ -561,9 +660,21 @@ func (s *Server) remoteUploadFrame(w http.ResponseWriter, r *http.Request) {
 		session.Frame = append(session.Frame[:0], body...)
 		session.ScreenWidth, session.ScreenHeight = width, height
 		session.UpdatedAt = time.Now()
+		notifyRemoteSession(session.FrameReady)
 	}
+	if !combinedResponse {
+		s.remote.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	events := remoteInputEventsAfter(session, inputAfter)
+	inputSequence, state := session.InputSequence, session.State
+	quality, clipboardEnabled := session.Quality, session.ClipboardEnabled
 	s.remote.mu.Unlock()
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"sequence": inputSequence, "state": state, "events": events,
+		"quality": quality, "clipboardEnabled": clipboardEnabled,
+	})
 }
 
 func (s *Server) remoteDownloadFrame(w http.ResponseWriter, r *http.Request) {
@@ -590,6 +701,10 @@ func (s *Server) remoteDownloadFrame(w http.ResponseWriter, r *http.Request) {
 			frame := append([]byte(nil), session.Frame...)
 			sequence, width, height := session.FrameSequence, session.ScreenWidth, session.ScreenHeight
 			session.UpdatedAt = time.Now()
+			select {
+			case <-session.FrameReady:
+			default:
+			}
 			s.remote.mu.Unlock()
 			w.Header().Set("Content-Type", "image/jpeg")
 			w.Header().Set("Cache-Control", "no-store")
@@ -600,16 +715,27 @@ func (s *Server) remoteDownloadFrame(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write(frame)
 			return
 		}
-		state := session.State
+		state, frameReady := session.State, session.FrameReady
 		s.remote.mu.Unlock()
 		if state == "closed" || state == "failed" || time.Now().After(deadline) {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		wait := time.Until(deadline)
+		if wait <= 0 {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		timer := time.NewTimer(wait)
 		select {
 		case <-r.Context().Done():
+			timer.Stop()
 			return
-		case <-time.After(100 * time.Millisecond):
+		case <-frameReady:
+			timer.Stop()
+		case <-timer.C:
+			w.WriteHeader(http.StatusNoContent)
+			return
 		}
 	}
 }
@@ -622,9 +748,21 @@ func validRemoteInput(event remoteInput) bool {
 		return event.DeltaX >= -4000 && event.DeltaX <= 4000 && event.DeltaY >= -4000 && event.DeltaY <= 4000
 	case "key":
 		return len(event.Key) <= 32 && len(event.Code) <= 32
+	case "clipboard":
+		return len(event.Text) <= remoteClipboardLimit
 	default:
 		return false
 	}
+}
+
+func remoteInputEventsAfter(session *remoteSession, after uint64) []sequencedRemoteInput {
+	events := make([]sequencedRemoteInput, 0)
+	for _, event := range session.Inputs {
+		if event.Sequence > after {
+			events = append(events, event)
+		}
+	}
+	return events
 }
 
 func (s *Server) remotePostInputs(w http.ResponseWriter, r *http.Request) {
@@ -666,6 +804,15 @@ func (s *Server) remotePostInputs(w http.ResponseWriter, r *http.Request) {
 	}
 	session.ControllerSeenAt = time.Now()
 	for _, event := range request.Events {
+		if event.Type == "clipboard" {
+			filtered := make([]sequencedRemoteInput, 0, len(session.Inputs))
+			for _, queued := range session.Inputs {
+				if queued.Event.Type != "clipboard" {
+					filtered = append(filtered, queued)
+				}
+			}
+			session.Inputs = filtered
+		}
 		session.InputSequence++
 		session.Inputs = append(session.Inputs, sequencedRemoteInput{Sequence: session.InputSequence, Event: event})
 	}
@@ -699,12 +846,7 @@ func (s *Server) remotePollInputs(w http.ResponseWriter, r *http.Request) {
 			s.remote.mu.Unlock()
 			return
 		}
-		events := make([]sequencedRemoteInput, 0)
-		for _, event := range session.Inputs {
-			if event.Sequence > after {
-				events = append(events, event)
-			}
-		}
+		events := remoteInputEventsAfter(session, after)
 		state, sequence := session.State, session.InputSequence
 		if len(events) > 0 {
 			session.UpdatedAt = time.Now()
@@ -718,6 +860,109 @@ func (s *Server) remotePollInputs(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+func (s *Server) remoteUploadClipboard(w http.ResponseWriter, r *http.Request) {
+	body, principal, ok := s.authenticateRemoteRequest(w, r, remoteJSONLimit)
+	if !ok {
+		return
+	}
+	var request struct {
+		Text string `json:"text"`
+	}
+	if !decodeRemoteJSON(w, body, &request) {
+		return
+	}
+	if len(request.Text) > remoteClipboardLimit {
+		writeError(w, http.StatusRequestEntityTooLarge, errors.New("剪贴板文本过大"))
+		return
+	}
+	s.remote.mu.Lock()
+	s.remote.cleanupLocked(time.Now())
+	session, found := s.withRemoteSession(w, r)
+	if !found {
+		s.remote.mu.Unlock()
+		return
+	}
+	if !authorizeRemoteDevice(w, principal, session.TargetDeviceID) {
+		s.remote.mu.Unlock()
+		return
+	}
+	if session.State != "active" || !session.ClipboardEnabled {
+		s.remote.mu.Unlock()
+		writeError(w, http.StatusConflict, errors.New("远程剪贴板未启用"))
+		return
+	}
+	session.ClipboardSequence++
+	session.ClipboardText = request.Text
+	session.UpdatedAt = time.Now()
+	notifyRemoteSession(session.ClipboardReady)
+	sequence := session.ClipboardSequence
+	s.remote.mu.Unlock()
+	writeJSON(w, http.StatusAccepted, map[string]uint64{"sequence": sequence})
+}
+
+func (s *Server) remoteDownloadClipboard(w http.ResponseWriter, r *http.Request) {
+	_, principal, ok := s.authenticateRemoteRequest(w, r, remoteJSONLimit)
+	if !ok {
+		return
+	}
+	after, afterErr := strconv.ParseUint(r.URL.Query().Get("after"), 10, 64)
+	if afterErr != nil {
+		writeError(w, http.StatusBadRequest, errors.New("剪贴板序号无效"))
+		return
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s.remote.mu.Lock()
+		s.remote.cleanupLocked(time.Now())
+		session, found := s.withRemoteSession(w, r)
+		if !found {
+			s.remote.mu.Unlock()
+			return
+		}
+		if !authorizeRemoteDevice(w, principal, session.ControllerDeviceID) {
+			s.remote.mu.Unlock()
+			return
+		}
+		session.ControllerSeenAt = time.Now()
+		state, enabled := session.State, session.ClipboardEnabled
+		sequence, clipboardText := session.ClipboardSequence, session.ClipboardText
+		clipboardReady := session.ClipboardReady
+		s.remote.mu.Unlock()
+		if state != "active" || !enabled {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if sequence > after {
+			select {
+			case <-clipboardReady:
+			default:
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"sequence": sequence, "text": clipboardText})
+			return
+		}
+		if time.Now().After(deadline) {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		wait := time.Until(deadline)
+		if wait <= 0 {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-r.Context().Done():
+			timer.Stop()
+			return
+		case <-clipboardReady:
+			timer.Stop()
+		case <-timer.C:
+			w.WriteHeader(http.StatusNoContent)
+			return
 		}
 	}
 }

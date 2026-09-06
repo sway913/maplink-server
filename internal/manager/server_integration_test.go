@@ -182,7 +182,7 @@ func TestHealthAdvertisesRemoteControlRelay(t *testing.T) {
 	server := integrationServer(t)
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/health", nil))
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"remote-control"`) || !strings.Contains(response.Body.String(), `"version":"0.7.1"`) {
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"remote-control"`) || !strings.Contains(response.Body.String(), `"version":"0.8.0"`) {
 		t.Fatalf("health endpoint does not advertise remote control: %d %s", response.Code, response.Body.String())
 	}
 }
@@ -213,13 +213,13 @@ func TestRemoteRelayAuthenticatesAndMovesFramesAndInputWithoutPersistence(t *tes
 		t.Fatalf("device listing failed: %d %s", devices.Code, devices.Body.String())
 	}
 
-	createBody := []byte(`{"targetDeviceID":"office-pc","controllerDeviceID":"home-mac","controllerSSHPublicKey":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcH maplink-managed"}`)
+	createBody := []byte(`{"targetDeviceID":"office-pc","controllerDeviceID":"home-mac","controllerSSHPublicKey":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcH maplink-managed","quality":"1080p60","clipboardEnabled":true}`)
 	created := remoteRelayRequest(t, server, http.MethodPost, "/api/remote/sessions", createBody, "create-session-nonce1")
 	if created.Code != http.StatusCreated {
 		t.Fatalf("session creation failed: %d %s", created.Code, created.Body.String())
 	}
 	var session remoteSessionView
-	if err := json.Unmarshal(created.Body.Bytes(), &session); err != nil || session.ID == "" {
+	if err := json.Unmarshal(created.Body.Bytes(), &session); err != nil || session.ID == "" || session.Quality != "1080p60" || !session.ClipboardEnabled {
 		t.Fatalf("invalid created session: %v %s", err, created.Body.String())
 	}
 
@@ -262,10 +262,70 @@ func TestRemoteRelayAuthenticatesAndMovesFramesAndInputWithoutPersistence(t *tes
 	if postedInput.Code != http.StatusAccepted {
 		t.Fatalf("input posting failed: %d %s", postedInput.Code, postedInput.Body.String())
 	}
+	postedClipboardInput := remoteRelayRequest(t, server, http.MethodPost, inputPath, []byte(`{"events":[{"type":"clipboard","text":"first"},{"type":"clipboard","text":"latest"}]}`), "post-input-clipboard1")
+	if postedClipboardInput.Code != http.StatusAccepted {
+		t.Fatalf("clipboard input posting failed: %d %s", postedClipboardInput.Code, postedClipboardInput.Body.String())
+	}
+	server.remote.mu.Lock()
+	clipboardInputs := 0
+	clipboardText := ""
+	for _, queued := range server.remote.sessions[session.ID].Inputs {
+		if queued.Event.Type == "clipboard" {
+			clipboardInputs++
+			clipboardText = queued.Event.Text
+		}
+	}
+	server.remote.mu.Unlock()
+	if clipboardInputs != 1 || clipboardText != "latest" {
+		t.Fatalf("clipboard input queue was not coalesced: count=%d text=%q", clipboardInputs, clipboardText)
+	}
 	pollPath := inputPath + "?after=0&wait=0"
 	polledInput := remoteRelayRequest(t, server, http.MethodGet, pollPath, nil, "poll-input-nonce001")
 	if polledInput.Code != http.StatusOK || !strings.Contains(polledInput.Body.String(), `"type":"button"`) {
 		t.Fatalf("input polling failed: %d %s", polledInput.Code, polledInput.Body.String())
+	}
+
+	combinedFramePath := framePath + "?inputAfter=0"
+	combinedFrameRequest := httptest.NewRequest(http.MethodPost, combinedFramePath, bytes.NewReader(frameBody))
+	timestamp = strconv.FormatInt(time.Now().Unix(), 10)
+	combinedFrameRequest.Header.Set("X-MapLink-Timestamp", timestamp)
+	combinedFrameRequest.Header.Set("X-MapLink-Nonce", "combined-frame-nonce1")
+	combinedFrameRequest.Header.Set("X-MapLink-Signature", remoteSignature("0123456789abcdef", http.MethodPost, combinedFramePath, timestamp, "combined-frame-nonce1", frameBody))
+	combinedFrameRequest.Header.Set("X-MapLink-Sequence", "2")
+	combinedFrameRequest.Header.Set("X-MapLink-Width", "1920")
+	combinedFrameRequest.Header.Set("X-MapLink-Height", "1080")
+	combinedFrameResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(combinedFrameResponse, combinedFrameRequest)
+	if combinedFrameResponse.Code != http.StatusOK || !strings.Contains(combinedFrameResponse.Body.String(), `"type":"button"`) || !strings.Contains(combinedFrameResponse.Body.String(), `"quality":"1080p60"`) {
+		t.Fatalf("combined frame/input exchange failed: %d %s", combinedFrameResponse.Code, combinedFrameResponse.Body.String())
+	}
+
+	settingsPath := "/api/remote/sessions/" + session.ID + "/settings"
+	updatedSettings := remoteRelayRequest(t, server, http.MethodPatch, settingsPath, []byte(`{"quality":"4k60","clipboardEnabled":true}`), "session-settings-001")
+	if updatedSettings.Code != http.StatusOK || !strings.Contains(updatedSettings.Body.String(), `"quality":"4k60"`) {
+		t.Fatalf("session settings update failed: %d %s", updatedSettings.Code, updatedSettings.Body.String())
+	}
+	invalidSettings := remoteRelayRequest(t, server, http.MethodPatch, settingsPath, []byte(`{"quality":"unlimited","clipboardEnabled":true}`), "session-settings-002")
+	if invalidSettings.Code != http.StatusBadRequest {
+		t.Fatalf("invalid quality was accepted: %d %s", invalidSettings.Code, invalidSettings.Body.String())
+	}
+
+	clipboardPath := "/api/remote/sessions/" + session.ID + "/clipboard"
+	uploadedClipboard := remoteRelayRequest(t, server, http.MethodPost, clipboardPath, []byte(`{"text":"target clipboard text"}`), "clipboard-upload-001")
+	if uploadedClipboard.Code != http.StatusAccepted {
+		t.Fatalf("clipboard upload failed: %d %s", uploadedClipboard.Code, uploadedClipboard.Body.String())
+	}
+	downloadedClipboard := remoteRelayRequest(t, server, http.MethodGet, clipboardPath+"?after=0", nil, "clipboard-download-1")
+	if downloadedClipboard.Code != http.StatusOK || !strings.Contains(downloadedClipboard.Body.String(), `"text":"target clipboard text"`) {
+		t.Fatalf("clipboard download failed: %d %s", downloadedClipboard.Code, downloadedClipboard.Body.String())
+	}
+	oversizedClipboard, err := json.Marshal(map[string]string{"text": strings.Repeat("x", remoteClipboardLimit+1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rejectedClipboard := remoteRelayRequest(t, server, http.MethodPost, clipboardPath, oversizedClipboard, "clipboard-upload-002")
+	if rejectedClipboard.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized clipboard was accepted: %d %s", rejectedClipboard.Code, rejectedClipboard.Body.String())
 	}
 
 	closePath := "/api/remote/sessions/" + session.ID

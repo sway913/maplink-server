@@ -214,7 +214,7 @@ func TestDeviceCredentialBindsIdentityAndRevocationClosesAccess(t *testing.T) {
 		t.Fatalf("expected claimed identity to be rejected, got %d %s", impersonated.Code, impersonated.Body.String())
 	}
 
-	createBody := []byte(`{"targetDeviceID":"office-pc","controllerDeviceID":"home-mac","controllerSSHPublicKey":""}`)
+	createBody := []byte(`{"targetDeviceID":"office-pc","controllerDeviceID":"home-mac","controllerSSHPublicKey":"","quality":"1080p60","clipboardEnabled":true}`)
 	created := deviceRemoteRequest(t, server, "home-mac", controllerCredential, http.MethodPost, "/api/remote/sessions", createBody, "device-session-create1")
 	if created.Code != http.StatusCreated {
 		t.Fatalf("device session create failed: %d %s", created.Code, created.Body.String())
@@ -232,6 +232,33 @@ func TestDeviceCredentialBindsIdentityAndRevocationClosesAccess(t *testing.T) {
 	accepted := deviceRemoteRequest(t, server, "office-pc", targetCredential, http.MethodPost, acceptPath, acceptBody, "device-session-accept2")
 	if accepted.Code != http.StatusOK {
 		t.Fatalf("target could not accept session: %d %s", accepted.Code, accepted.Body.String())
+	}
+	settingsPath := "/api/remote/sessions/" + session.ID + "/settings"
+	settingsBody := []byte(`{"quality":"4k60","clipboardEnabled":true}`)
+	wrongSettingsRole := deviceRemoteRequest(t, server, "office-pc", targetCredential, http.MethodPatch, settingsPath, settingsBody, "device-session-settings1")
+	if wrongSettingsRole.Code != http.StatusForbidden {
+		t.Fatalf("target changed controller settings: %d %s", wrongSettingsRole.Code, wrongSettingsRole.Body.String())
+	}
+	updatedSettings := deviceRemoteRequest(t, server, "home-mac", controllerCredential, http.MethodPatch, settingsPath, settingsBody, "device-session-settings2")
+	if updatedSettings.Code != http.StatusOK || !strings.Contains(updatedSettings.Body.String(), `"quality":"4k60"`) {
+		t.Fatalf("controller could not change session settings: %d %s", updatedSettings.Code, updatedSettings.Body.String())
+	}
+	clipboardPath := "/api/remote/sessions/" + session.ID + "/clipboard"
+	wrongClipboardRole := deviceRemoteRequest(t, server, "home-mac", controllerCredential, http.MethodPost, clipboardPath, []byte(`{"text":"controller must use the input queue"}`), "device-clipboard-role1")
+	if wrongClipboardRole.Code != http.StatusForbidden {
+		t.Fatalf("controller uploaded target clipboard state: %d %s", wrongClipboardRole.Code, wrongClipboardRole.Body.String())
+	}
+	targetClipboard := deviceRemoteRequest(t, server, "office-pc", targetCredential, http.MethodPost, clipboardPath, []byte(`{"text":"copied on target"}`), "device-clipboard-role2")
+	if targetClipboard.Code != http.StatusAccepted {
+		t.Fatalf("target could not upload clipboard state: %d %s", targetClipboard.Code, targetClipboard.Body.String())
+	}
+	wrongClipboardReader := deviceRemoteRequest(t, server, "office-pc", targetCredential, http.MethodGet, clipboardPath+"?after=0", nil, "device-clipboard-role3")
+	if wrongClipboardReader.Code != http.StatusForbidden {
+		t.Fatalf("target read controller clipboard endpoint: %d %s", wrongClipboardReader.Code, wrongClipboardReader.Body.String())
+	}
+	controllerClipboard := deviceRemoteRequest(t, server, "home-mac", controllerCredential, http.MethodGet, clipboardPath+"?after=0", nil, "device-clipboard-role4")
+	if controllerClipboard.Code != http.StatusOK || !strings.Contains(controllerClipboard.Body.String(), `"text":"copied on target"`) {
+		t.Fatalf("controller could not read target clipboard: %d %s", controllerClipboard.Code, controllerClipboard.Body.String())
 	}
 	policy := adminRequest(t, server, admin, http.MethodPut, "/api/devices/policy", []byte(`{"allowLegacyRemoteAuth":false}`))
 	if policy.Code != http.StatusOK || server.devices.legacyRemoteAuthAllowed() {

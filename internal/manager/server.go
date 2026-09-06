@@ -151,12 +151,15 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/remote/hosts/{deviceID}/sessions", s.remoteHostSessions)
 	s.mux.HandleFunc("POST /api/remote/sessions", s.remoteCreateSession)
 	s.mux.HandleFunc("GET /api/remote/sessions/{sessionID}", s.remoteSessionStatus)
+	s.mux.HandleFunc("PATCH /api/remote/sessions/{sessionID}/settings", s.remoteUpdateSessionSettings)
 	s.mux.HandleFunc("DELETE /api/remote/sessions/{sessionID}", s.remoteCloseSession)
 	s.mux.HandleFunc("POST /api/remote/sessions/{sessionID}/accept", s.remoteAcceptSession)
 	s.mux.HandleFunc("POST /api/remote/sessions/{sessionID}/frames", s.remoteUploadFrame)
 	s.mux.HandleFunc("GET /api/remote/sessions/{sessionID}/frames", s.remoteDownloadFrame)
 	s.mux.HandleFunc("POST /api/remote/sessions/{sessionID}/inputs", s.remotePostInputs)
 	s.mux.HandleFunc("GET /api/remote/sessions/{sessionID}/inputs", s.remotePollInputs)
+	s.mux.HandleFunc("POST /api/remote/sessions/{sessionID}/clipboard", s.remoteUploadClipboard)
+	s.mux.HandleFunc("GET /api/remote/sessions/{sessionID}/clipboard", s.remoteDownloadClipboard)
 	s.mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status":   "ok",
